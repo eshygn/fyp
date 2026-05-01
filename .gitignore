@@ -1,0 +1,7 @@
+models/
+data/filtered_Qwen3-4B.jsonl
+data/prepared/
+results/
+__pycache__/
+*.pyc
+*.tar.gz

@@ -33,75 +33,87 @@ from trl import DPOTrainer, DPOConfig
 
 class LengthNormalisedDPOTrainer(DPOTrainer):
     """
-    DPO Trainer with length-normalised implicit rewards.
-
-    Standard DPO computes:
-        reward(x, y) = β * [log π_θ(y|x) - log π_ref(y|x)]
-
-    This causes training saturation because longer sequences accumulate
-    more log-probability mass, dominating the reward signal
-    (observed by Natarajan 2025 at ~step 20 with reward ceiling of 17).
-
-    Length-normalised DPO instead computes:
-        reward(x, y) = β * [log π_θ(y|x) - log π_ref(y|x)] / |y|
-
-    This prevents longer sequences from dominating and allows continued
-    learning beyond the saturation point.
+    DPO Trainer with length-normalised log probabilities.
+    Divides sequence log probs by completion length before computing
+    implicit rewards, preventing longer sequences from dominating
+    and reducing reward margin saturation.
     """
 
-    def dpo_loss(
-        self,
-        policy_chosen_logps,
-        policy_rejected_logps,
-        reference_chosen_logps,
-        reference_rejected_logps,
-    ):
-        """Override DPO loss to normalise by response length."""
-        # Compute per-sequence rewards (these are summed log probs)
-        chosen_rewards = policy_chosen_logps - reference_chosen_logps
-        rejected_rewards = policy_rejected_logps - reference_rejected_logps
+    def _compute_loss(self, model, inputs, return_outputs):
+        import torch
+        from trl.trainer.utils import selective_log_softmax
+        from peft import get_peft_model
+        from trl.trainer.dpo_trainer import disable_gradient_checkpointing, use_adapter
 
-        # Normalise by stored sequence lengths
-        if (hasattr(self, '_chosen_lengths') and
-            hasattr(self, '_rejected_lengths') and
-            self._chosen_lengths is not None and
-            self._rejected_lengths is not None):
-            chosen_lengths = self._chosen_lengths.clamp(min=1).float()
-            rejected_lengths = self._rejected_lengths.clamp(min=1).float()
-            chosen_rewards = chosen_rewards / chosen_lengths
-            rejected_rewards = rejected_rewards / rejected_lengths
+        mode = "train" if self.model.training else "eval"
+        device = self.accelerator.device
 
-        # Standard sigmoid DPO loss with normalised rewards
-        logits = chosen_rewards - rejected_rewards
-        loss = -F.logsigmoid(self.beta * logits)
+        _non_model_keys = {"completion_mask", "ref_chosen_logps", "ref_rejected_logps"}
+        model_kwargs = {k: v for k, v in inputs.items() if k not in _non_model_keys}
+        model_kwargs["use_cache"] = False
+        outputs = model(**model_kwargs)
 
-        # Metrics for logging
-        chosen_reward_mean = chosen_rewards.detach().mean()
-        rejected_reward_mean = rejected_rewards.detach().mean()
-        reward_margin = (chosen_rewards - rejected_rewards).detach().mean()
+        input_ids = inputs["input_ids"]
+        completion_mask = inputs["completion_mask"]
+        shift_logits = outputs.logits[..., :-1, :].contiguous()
+        shift_labels = input_ids[..., 1:].contiguous()
+        shift_completion_mask = completion_mask[..., 1:].contiguous()
+        per_token_logps = selective_log_softmax(shift_logits, shift_labels)
+        per_token_logps[shift_completion_mask == 0] = 0.0
 
-        return loss.mean(), chosen_reward_mean, rejected_reward_mean
+        # LENGTH NORMALISATION: divide by completion length instead of summing
+        completion_lens = shift_completion_mask.sum(dim=1).float().clamp(min=1.0)
+        logps = per_token_logps.sum(dim=1) / completion_lens
 
-    def get_batch_loss_metrics(self, model, batch, train_eval="train"):
-        """Override to capture response lengths before loss computation."""
-        # Extract response lengths from the batch labels
-        # In DPO, the batch contains concatenated chosen+rejected sequences
-        # We need to figure out the response token counts
+        chosen_logps, rejected_logps = logps.chunk(2, dim=0)
 
-        # Get the labels - non-padding, non-prompt tokens
-        if 'chosen_labels' in batch:
-            chosen_labels = batch['chosen_labels']
-            rejected_labels = batch['rejected_labels']
-            # Count non-(-100) tokens as response length
-            self._chosen_lengths = (chosen_labels != -100).sum(dim=1)
-            self._rejected_lengths = (rejected_labels != -100).sum(dim=1)
+        if self.precompute_ref_logps:
+            ref_chosen_logps = inputs["ref_chosen_logps"]
+            ref_rejected_logps = inputs["ref_rejected_logps"]
         else:
-            # Fallback: try to get lengths from input_ids
-            self._chosen_lengths = None
-            self._rejected_lengths = None
+            with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+                if hasattr(model, "peft_config") and self.ref_model is None:
+                    model_unwrapped = self.accelerator.unwrap_model(model)
+                    with use_adapter(model_unwrapped, adapter_name="ref" if "ref" in model_unwrapped.peft_config else None):
+                        ref_outputs = self.model(**model_kwargs)
+                else:
+                    ref_model = self.ref_model if self.ref_model is not None else model
+                    ref_outputs = ref_model(**model_kwargs)
 
-        # Call parent's method which will in turn call our overridden dpo_loss
-        return super().get_batch_loss_metrics(model, batch, train_eval)
+                ref_shift_logits = ref_outputs.logits[..., :-1, :].contiguous()
+                ref_per_token_logps = selective_log_softmax(ref_shift_logits, shift_labels)
+                ref_per_token_logps[shift_completion_mask == 0] = 0.0
+                # Apply same length normalisation to reference
+                ref_logps = ref_per_token_logps.sum(dim=1) / completion_lens
+                ref_chosen_logps, ref_rejected_logps = ref_logps.chunk(2, dim=0)
+
+        # Compute DPO loss using beta-scaled log ratios
+        import torch.nn.functional as F
+        pi_log_ratios = chosen_logps - rejected_logps
+        ref_log_ratios = ref_chosen_logps - ref_rejected_logps
+        logits = pi_log_ratios - ref_log_ratios
+        loss = -F.logsigmoid(self.beta * logits).mean()
+
+        # Compute metrics
+        chosen_rewards = self.beta * (chosen_logps - ref_chosen_logps).detach()
+        rejected_rewards = self.beta * (rejected_logps - ref_rejected_logps).detach()
+        reward_accuracies = (chosen_rewards > rejected_rewards).float()
+
+        metrics = {}
+        prefix = "eval_" if mode == "eval" else ""
+        metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().item()
+        metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().item()
+        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().item()
+        metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().item()
+        metrics[f"{prefix}logps/chosen"] = chosen_logps.detach().mean().item()
+        metrics[f"{prefix}logps/rejected"] = rejected_logps.detach().mean().item()
+        metrics[f"{prefix}logits/chosen"] = logits.detach().mean().item()
+        metrics[f"{prefix}logits/rejected"] = (-logits).detach().mean().item()
+
+        self.log(metrics)
+        if return_outputs:
+            return loss, metrics
+        return loss
 
 
 def get_model_and_tokenizer(model_name: str, use_4bit: bool = True):

@@ -68,12 +68,17 @@ def generate_story(model, tokenizer, prompt: str, max_new_tokens: int = 1024):
             temperature=0.7,
             top_p=0.9,
             do_sample=True,
+
             pad_token_id=tokenizer.pad_token_id,
         )
 
     # Decode only the generated tokens (not the prompt)
     generated = outputs[0][inputs['input_ids'].shape[1]:]
     story = tokenizer.decode(generated, skip_special_tokens=True)
+    if "</think>" in story:
+        story = story.split("</think>", 1)[1].strip()
+    elif "<think>" in story:
+        story = ""  # pure thinking, no actual story
     return story
 
 

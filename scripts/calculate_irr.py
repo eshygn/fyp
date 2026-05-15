@@ -28,6 +28,7 @@ PAIRED_CONDITIONS = [
     "baseline",
     "dpo_b01", "dpo_b03", "dpo_b05",
     "dpo_ln_b01", "dpo_ln_b03", "dpo_ln_b05",
+    "dpo_aligned_b01", "dpo_aligned_b03", "dpo_aligned_b05",
 ]
 
 

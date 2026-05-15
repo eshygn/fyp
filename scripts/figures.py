@@ -70,7 +70,8 @@ COLORS = {
 FAMILIES = {
     "baseline":   ["baseline"],
     "misaligned": ["dpo_b01", "dpo_b03", "dpo_b05"],
-    "ln_dpo":     ["dpo_ln_b01", "dpo_ln_b03", "dpo_ln_b05"],
+    "ln_dpo":     ["dpo_ln_b01", "dpo_ln_b03", "dpo_ln_b05",
+                         "dpo_aligned_b01", "dpo_aligned_b03", "dpo_aligned_b05"],
     "aligned":    ["dpo_aligned_b01", "dpo_aligned_b03", "dpo_aligned_b05"],
 }
 FAMILY_COLORS = {
@@ -403,7 +404,8 @@ def fig_aligned_vs_misaligned(scores_by_cond, summary_path, out_path):
 def fig_sonnet_vs_gemini_scatter(results_dir, out_path):
     """Scatter plot of Sonnet vs Gemini scores across all paired evaluations."""
     paired_conditions = ["baseline", "dpo_b01", "dpo_b03", "dpo_b05",
-                         "dpo_ln_b01", "dpo_ln_b03", "dpo_ln_b05"]
+                         "dpo_ln_b01", "dpo_ln_b03", "dpo_ln_b05",
+                         "dpo_aligned_b01", "dpo_aligned_b03", "dpo_aligned_b05"]
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
     for ax, dim in zip(axes, DIMS):
